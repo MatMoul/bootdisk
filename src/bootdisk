@@ -1,0 +1,182 @@
+#!/bin/bash
+
+version="0.1"
+
+qemubin=qemu-system-x86_64
+bootargs=
+qemucpucores=$(nproc --all)
+qemumem=$(grep MemTotal /proc/meminfo | awk '{print int($2/3000)}')
+qemurtcbase=utc
+qemusrctype=-hda
+qemusrc=
+qemuworkdir=$(mktemp -d -u)
+qemuworkdirpersistent=
+diskoverlay=
+bootcmd=bootefi
+
+ovmfcode=/usr/share/edk2-ovmf/x64/OVMF_CODE.fd
+ovmfcodesb=/usr/share/edk2-ovmf/x64/OVMF_CODE.secboot.fd
+ovmfvars=/usr/share/edk2-ovmf/x64/OVMF_VARS.fd
+
+inittpm(){
+	swtpm socket \
+		--tpm2 \
+		--tpmstate dir=${qemuworkdir} \
+		--ctrl type=unixio,path=${qemuworkdir}/swtpm-sock &
+}
+initsecureboot(){
+	if [[ ! -f ${qemuworkdir}/OVMF_CODE.secboot.fd ]]; then
+		cp ${ovmfcodesb} ${qemuworkdir}/OVMF_CODE.secboot.fd
+	fi
+	if [[ ! -f ${qemuworkdir}/OVMF_VARS.fd ]]; then
+		cp ${ovmfvars} ${qemuworkdir}/OVMF_VARS.fd
+	fi
+}
+initbootargs(){
+	bootargs="-boot menu=on,strict=on,reboot-timeout=1000 "
+	bootargs+="-no-hpet "
+	bootargs+="-rtc base=${qemurtcbase} "
+	bootargs+="-cpu host "
+	bootargs+="-smp cores=${qemucpucores} "
+	bootargs+="-m ${qemumem} "
+	bootargs+="-device intel-hda -device hda-duplex "
+	bootargs+="-usbdevice tablet "
+	bootargs+="-vga qxl "
+	bootargs+="-display gtk,window-close=off "
+}
+
+bootbios(){
+	echo "Booting BIOS..."
+	initbootargs
+	${qemubin} \
+		${bootargs} \
+		-machine accel=kvm \
+		${qemusrctype} ${qemusrc} \
+		${qemusdb}
+}
+bootefi(){
+	echo "Booting EFI..."
+	initbootargs
+	${qemubin} \
+		-bios ${ovmfcode} \
+		${bootargs} \
+		-machine accel=kvm \
+		${qemusrctype} ${qemusrc} \
+		${qemusdb}
+}
+bootefitpm(){
+	echo "Booting EFI + TPM..."
+	inittpm
+	initbootargs
+	${qemubin} \
+		-bios ${ovmfcode} \
+		${bootargs} \
+		-machine accel=kvm \
+		-chardev socket,id=tpmchar,path=${qemuworkdir}/swtpm-sock \
+		-tpmdev emulator,id=tpmdev,chardev=tpmchar \
+		-device tpm-tis,tpmdev=tpmdev \
+		${qemusrctype} ${qemusrc} \
+		${qemusdb}
+}
+bootefisec(){
+	echo "Booting EFI + TPM + Secure boot..."
+	inittpm
+	initsecureboot
+	initbootargs
+	${qemubin} \
+		-bios ${ovmfcode} \
+		${bootargs} \
+		-machine type=q35,smm=on,accel=kvm \
+		-global driver=cfi.pflash01,property=secure,value=on \
+		-global ICH9-LPC.disable_s3=1 \
+		-drive if=pflash,format=raw,unit=0,file=${qemuworkdir}/OVMF_CODE.secboot.fd,readonly=on \
+		-drive if=pflash,format=raw,unit=1,file=${qemuworkdir}/OVMF_VARS.fd \
+		-chardev socket,id=tpmchar,path=${qemuworkdir}/swtpm-sock \
+		-tpmdev emulator,id=tpmdev,chardev=tpmchar \
+		-device tpm-tis,tpmdev=tpmdev \
+		${qemusrctype} ${qemusrc} \
+		${qemusdb}
+}
+
+help(){
+	echo "bootdisk ${version} by MatMoul"
+	echo ""
+  echo "Usage :"
+  echo "-------"
+	echo "bootdisk [options] device|file"
+	echo ""
+	echo "--help | -h : show this help"
+	echo ""
+	echo "Options :"
+	echo "  -wd      : Work Dir (default in tmp random folder, mktemp)"
+	echo "  -wdp     : Work Dir Persistent"
+	echo "  -boot    : Boot mode [bios|efi|tpm|secure] (default : efi)"
+	echo "  -cores   : CPU cores"
+	echo "  -mem     : Memory in Mb"
+	echo "  -dd      : Additional device"
+	echo "  -cdr     : Force boot dev as cd-rom (not needed for iso file)"
+	echo "  -overlay : Add overlay on boot device"
+}
+
+
+while (( ${#} )); do
+  case ${1} in
+    -h|--help) help
+							 exit 0;;
+		-wd) qemuworkdir=${2}
+		     shift;;
+		-wdp) qemuworkdirpersistent=1;;
+		-boot) case ${2} in
+					 	bios) bootcmd=bootbios;;
+						efi) bootcmd=bootefi;;
+						tpm) bootcmd=bootefitpm;;
+						secure) bootcmd=bootefisec;;
+					 esac
+					 shift;;
+		-cores) qemucpucores=${2}
+		    		shift;;
+		-mem) qemumem=${2}
+		      shift;;
+		-dd) qemusdb="-hdb ${2}"
+				 shift;;
+		-cdr) qemusrctype=-cdrom;;
+		-overlay) diskoverlay=1;;
+		*) qemusrc=${1};;
+  esac
+  shift
+done
+
+if [ ${qemusrc: -4} == ".iso" ]; then
+	qemusrctype=-cdrom
+fi
+
+initworkdir(){
+	if [[ ! -d ${qemuworkdir} ]]; then
+		mkdir -p ${qemuworkdir}
+	fi
+}
+releaseworkdir(){
+	if [[ -d ${qemuworkdir} ]]; then
+		if [[ ! ${qemuworkdirpersistent} ]]; then
+			rm -R ${qemuworkdir}
+		fi
+	fi
+}
+initoverlay(){
+	if [[ ! "${qemusrctype}" == "-cdrom" ]]; then
+		if [[ ! -f "${qemuworkdir}/overlay.cow" ]]; then
+			sourceformat=$(qemu-img info ${qemusrc} | grep "file format" | awk -F':' '{print $2}')
+			qemu-img create -f qcow2 -F ${sourceformat} -b ${qemusrc} ${qemuworkdir}/overlay.cow
+		fi
+		qemusrc=${qemuworkdir}/overlay.cow
+	fi
+}
+
+if [[ -n "${qemusrc}" ]]; then
+	initworkdir
+	if [[ ${diskoverlay} ]]; then
+		initoverlay
+	fi
+	${bootcmd}
+	releaseworkdir
+fi
